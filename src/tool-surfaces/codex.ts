@@ -10,6 +10,7 @@ import {
 } from "./types.js";
 import {
   contentText,
+  mergeShellCommands,
   resultOutputSchema,
   runLoggedToolOperation,
   textBlock,
@@ -139,10 +140,17 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
     {
       title: "Execute command",
       description:
-        "Run a command with the local user's authority. Commands are not sandboxed; workspace validation only selects the initial working directory. Returns the result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
+        "Run one or more commands with the local user's authority. Commands are not sandboxed; workspace validation only selects the initial working directory. Multiple commands run in order in one shell process. Returns the result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
-        cmd: z.string().min(1).describe("Shell command to execute."),
+        cmd: z
+          .union([
+            z.string().min(1),
+            z.array(z.string().min(1)).min(1),
+          ])
+          .describe(
+            "Shell command to execute, or a non-empty array of commands to execute sequentially in the same shell process.",
+          ),
         tty: z
           .boolean()
           .optional()
@@ -200,14 +208,18 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       maxOutputTokens,
     }) => {
       const startedAt = performance.now();
+      const command = mergeShellCommands(
+        cmd,
+        process.platform === "win32" ? " & " : "\n",
+      );
       const snapshot = await runLoggedToolOperation(
         config,
         {
           tool: "exec_command",
           workspaceId,
           workingDirectory: workingDirectory ?? ".",
-          command: cmd,
-          commandLength: cmd.length,
+          command,
+          commandLength: command.length,
         },
         startedAt,
         async () => {
@@ -218,7 +230,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           );
           return processSessions.start({
             workspaceId,
-            command: cmd,
+            command,
             cwd,
             workspaceRoot: workspace.root,
             tty,

@@ -172,6 +172,10 @@ In this mode, `write`, `edit`, and `bash` are not registered. `exec_command`
 returns a process session ID when a command is still
 running after its yield window. Use `write_stdin` to poll it, send input, resize
 a PTY, or send Ctrl-C. Set `tty: true` only for commands that need a terminal.
+Both `exec_command.cmd` and Claude-mode `bash.command` accept either one
+command string or a non-empty array of command strings. Array entries execute
+in order inside one shell process, so they share shell state and produce one
+combined result/session.
 
 Set `tools.mode` to `claude` in `~/.devspace/config.jsonc` to expose `write`,
 `edit`, and `bash` instead of the Codex mutation and command tools. Dedicated

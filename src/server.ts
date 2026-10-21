@@ -8,7 +8,7 @@ import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelconte
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import {
   registerAppResource,
   registerAppTool,
@@ -400,9 +400,18 @@ export function createMcpServer(
         { path, mode, baseRef },
         { conversationScopeId: openAiConversationScopeId(_meta) },
       );
+      const contextReadyAt = performance.now();
+      logEvent(config.logging, "info", "workspace_open_phase", {
+        workspaceId: workspace.id, phase: "context", workspaceReused,
+        durationMs: Math.round(contextReadyAt - startedAt),
+      });
       const review = await reviewCheckpoints.initializeWorkspace({
         workspaceId: workspace.id,
         root: workspace.root,
+      });
+      logEvent(config.logging, "info", "workspace_open_phase", {
+        workspaceId: workspace.id, phase: "review_checkpoint", available: review.available,
+        durationMs: Math.round(performance.now() - contextReadyAt),
       });
       const cardSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
@@ -842,7 +851,7 @@ export function createServer(
     });
     if (res.headersSent) return;
 
-    if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })) {
+    if (!oauthProvider.acceptsResource(req.auth?.resource)) {
       logEvent(config.logging, "warn", "auth_denied", {
         requestId,
         method: req.method,

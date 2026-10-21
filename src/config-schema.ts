@@ -51,6 +51,7 @@ const loggingConfigSchema = z.object({
 }).strict().prefault({});
 
 const oauthConfigSchema = z.object({
+  resourceAliases: z.array(z.string().url()).default([]),
   accessTokenTtlSeconds: z.number().int().positive().default(60 * 60),
   refreshTokenTtlSeconds: z.number().int().positive().default(30 * 24 * 60 * 60),
   scopes: z.array(z.string().trim().min(1)).min(1).default(["devspace"]),

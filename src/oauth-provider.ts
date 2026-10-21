@@ -13,6 +13,7 @@ import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextpro
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
 export interface OAuthConfig {
+  resourceAliases?: string[];
   ownerToken: string;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
@@ -127,12 +128,20 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
   }
 
+  // Accept the primary resource or an explicitly configured exact resource alias.
+  acceptsResource(resource: URL | undefined): boolean {
+    if (!resource) return false;
+    return checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })
+      || (this.config.resourceAliases ?? []).some((alias) => new URL(alias).href === resource.href);
+  }
+
+  // Validate the requested resource and scope before displaying the owner authorization form.
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    if (!params.resource || !checkResourceAllowed({ requestedResource: params.resource, configuredResource: this.resourceServerUrl })) {
+    if (!this.acceptsResource(params.resource)) {
       throw new InvalidRequestError("Invalid or missing OAuth resource");
     }
     if (!requestedScopesAllowed(params.scopes ?? [], this.config.scopes)) {
@@ -188,6 +197,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return record.params.codeChallenge;
   }
 
+  // Exchange an authorized code while retaining its resource binding.
   async exchangeAuthorizationCode(
     client: OAuthClientInformationFull,
     authorizationCode: string,
@@ -199,7 +209,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (redirectUri && redirectUri !== record.params.redirectUri) {
       throw new InvalidGrantError("redirect_uri does not match the authorization request");
     }
-    if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
+    if (resource && !this.acceptsResource(resource)) {
       throw new InvalidGrantError("Invalid resource");
     }
 
@@ -207,6 +217,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     return this.issueTokens(client.client_id, record.params.scopes ?? this.config.scopes, record.params.resource);
   }
 
+  // Refresh only tokens whose requested resource belongs to this configured service.
   async exchangeRefreshToken(
     client: OAuthClientInformationFull,
     refreshToken: string,
@@ -218,7 +229,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidGrantError("Invalid refresh token");
     }
-    if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
+    if (resource && !this.acceptsResource(resource)) {
       throw new InvalidGrantError("Invalid resource");
     }
 

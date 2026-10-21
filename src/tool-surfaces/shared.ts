@@ -20,6 +20,13 @@ export function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   };
 }
 
+export function mergeShellCommands(
+  command: string | string[],
+  separator = "\n",
+): string {
+  return Array.isArray(command) ? command.join(separator) : command;
+}
+
 export function workspaceAppDescriptorMeta(config: ServerConfig): ToolWidgetDescriptorMeta {
   if (!config.uiEnabled) return { _meta: {} };
 

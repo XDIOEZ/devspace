@@ -1,6 +1,6 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 
 export type ReviewSince = "last_shown" | "workspace_open";
@@ -280,18 +280,33 @@ function reviewRefs(
   };
 }
 
+// Build an isolated snapshot, retaining unchanged files' stat cache without touching the user's index.
 async function createWorkingTreeSnapshot(gitRoot: string, parent: string): Promise<string> {
   const tempDir = await mkdtemp(join(tmpdir(), "devspace-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
   try {
-    await git(gitRoot, ["read-tree", "HEAD"], { env });
+    await seedSnapshotIndex(gitRoot, indexPath);
+    await git(gitRoot, ["read-tree", "--reset", "HEAD"], { env });
     await git(gitRoot, ["add", "-A", "--", "."], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
     return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+// Copy a standalone index as a cache; split indexes keep the original clean-index initialization.
+async function seedSnapshotIndex(gitRoot: string, indexPath: string): Promise<void> {
+  const sharedIndex = (await git(gitRoot, ["rev-parse", "--shared-index-path"])).stdout.trim();
+  if (sharedIndex) return;
+  const source = (await git(gitRoot, ["rev-parse", "--git-path", "index"])).stdout.trim();
+  try {
+    await copyFile(resolve(gitRoot, source), indexPath);
+  } catch (error) {
+    // A checkout without an index is valid; read-tree will populate the private index from HEAD.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 

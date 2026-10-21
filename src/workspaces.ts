@@ -10,6 +10,8 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree } from "./git-worktrees.js";
+import { git } from "./git.js";
+import { logEvent } from "./logger.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -91,6 +93,7 @@ type DirectoryOps = {
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
+  private readonly pendingInstructionScans = new Map<string, Promise<string[]>>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -435,6 +438,7 @@ export class WorkspaceRegistry {
     return loadedFiles;
   }
 
+  // Filter discovered instructions against the context already loaded for this workspace.
   private async findAvailableAgentsFiles(
     root: string,
     loadedFiles: LoadedAgentsFile[],
@@ -447,17 +451,71 @@ export class WorkspaceRegistry {
     }
     const discovered: AvailableAgentsFile[] = [];
 
-    await walkWorkspace(root, async (path, entry) => {
-      if (!entry.isFile()) return;
-      if (!CONTEXT_FILE_NAMES.has(entry.name)) return;
-      if (loadedPaths.has(path)) return;
+    for (const path of await this.discoverInstructionPaths(root)) {
+      if (loadedPaths.has(path)) continue;
       const realPath = await tryRealpath(path);
-      if (realPath && loadedRealPaths.has(realPath)) return;
+      if (!realPath || loadedRealPaths.has(realPath)) continue;
 
       discovered.push({ path });
-    });
+    }
 
     return discovered.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  // Share simultaneous scans without retaining stale results after project instructions change.
+  private async discoverInstructionPaths(root: string): Promise<string[]> {
+    const key = await canonicalPath(root);
+    const pending = this.pendingInstructionScans.get(key);
+    if (pending) return pending;
+    const scan = discoverInstructionPaths(root, this.config);
+    this.pendingInstructionScans.set(key, scan);
+    try {
+      return await scan;
+    } finally {
+      this.pendingInstructionScans.delete(key);
+    }
+  }
+}
+
+// Let Git prune ignored trees while preserving tracked instructions, including ignored tracked files.
+async function discoverInstructionPaths(root: string, config: ServerConfig): Promise<string[]> {
+  const startedAt = performance.now();
+  let method = "directory_walk";
+  let paths: string[] = [];
+  try {
+    let isGit = false;
+    try {
+      isGit = (await git(root, ["rev-parse", "--is-inside-work-tree"])).stdout.trim() === "true";
+    } catch {
+      // Non-Git workspaces retain the existing filesystem discovery behavior.
+    }
+    if (isGit) {
+      method = "git_ls_files";
+      try {
+        const result = await git(root, [
+          "ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z", "--",
+          ...Array.from(CONTEXT_FILE_NAMES, (name) => `:(glob)**/${name}`),
+        ]);
+        const gitRoot = (await git(root, ["rev-parse", "--show-toplevel"])).stdout.trim();
+        paths = [...new Set(result.stdout.split("\0").filter(Boolean))]
+          .map((path) => resolve(gitRoot, path))
+          .filter((path) => isPathInsideRoot(path, root));
+        return paths;
+      } catch (error) {
+        logEvent(config.logging, "warn", "workspace_instruction_scan_fallback", {
+          root, error: error instanceof Error ? error.message : String(error),
+        });
+        method = "directory_walk";
+      }
+    }
+    await walkWorkspace(root, (path, entry) => {
+      if (entry.isFile() && CONTEXT_FILE_NAMES.has(entry.name)) paths.push(path);
+    });
+    return paths;
+  } finally {
+    logEvent(config.logging, "info", "workspace_instruction_scan", {
+      root, method, count: paths.length, durationMs: Math.round(performance.now() - startedAt),
+    });
   }
 }
 

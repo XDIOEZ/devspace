@@ -48,6 +48,44 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }
 });
 
+test("command tools accept multiple commands in one call", async (t) => {
+  const cases: Array<{
+    mode: ToolMode;
+    tool: "exec_command" | "bash";
+    argumentName: "cmd" | "command";
+  }> = [
+    { mode: "codex", tool: "exec_command", argumentName: "cmd" },
+    { mode: "claude", tool: "bash", argumentName: "command" },
+  ];
+
+  for (const { mode, tool, argumentName } of cases) {
+    await t.test(mode, async (nested) => {
+      const context = await fixture(nested, { toolMode: mode, uiEnabled: false });
+      const opened = structuredContent(
+        await callOpen(context.client, context.project, `multi-command-${mode}`),
+      );
+      const workspaceId = opened.workspaceId;
+      assert.equal(typeof workspaceId, "string");
+      await mkdir(join(context.project, "nested"));
+
+      const result = await context.client.callTool({
+        name: tool,
+        arguments: {
+          workspaceId,
+          [argumentName]: [
+            "cd nested",
+            "node -e \"console.log('second-command:' + process.cwd())\"",
+          ],
+        },
+      });
+      const output = structuredContent(result).result;
+      assert.ok(typeof output === "string");
+      assert.match(output, /second-command/);
+      assert.match(output, /nested/);
+    });
+  }
+});
+
 test("UI metadata is limited to workspace and aggregate review", async (t) => {
   for (const uiEnabled of [true, false]) {
     await t.test(uiEnabled ? "enabled" : "disabled", async (nested) => {

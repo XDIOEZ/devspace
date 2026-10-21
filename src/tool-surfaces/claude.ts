@@ -18,6 +18,7 @@ import {
   countDiffStats,
   logFailedToolResponse,
   logToolCall,
+  mergeShellCommands,
   resultOutputSchema,
   textBlock,
 } from "./shared.js";
@@ -36,7 +37,7 @@ export function registerClaudeTools(context: ToolRegistrationContext): void {
   registerShellTool(context);
 }
 
-const CLAUDE_SHELL_DESCRIPTION = `Run a shell command with the local user's authority. Commands are not sandboxed; workspace validation only selects the initial working directory. Use this for file inspection, tests, builds, package scripts, and other commands.`;
+const CLAUDE_SHELL_DESCRIPTION = `Run one or more shell commands with the local user's authority. Commands are not sandboxed; workspace validation only selects the initial working directory. Multiple commands run in order in one shell process. Use this for file inspection, tests, builds, package scripts, and other commands.`;
 
 function registerClaudeMutationTools(context: ToolRegistrationContext): void {
   const { server, config, workspaces } = context;
@@ -182,8 +183,13 @@ function registerShellTool(context: ToolRegistrationContext): void {
       inputSchema: {
         workspaceId: z.string().describe(workspaceIdDescription),
         command: z
-          .string()
-          .describe("Shell command to execute."),
+          .union([
+            z.string().min(1),
+            z.array(z.string().min(1)).min(1),
+          ])
+          .describe(
+            "Shell command to execute, or a non-empty array of commands to execute sequentially in the same shell process.",
+          ),
         workingDirectory: z
           .string()
           .optional()
@@ -200,13 +206,15 @@ function registerShellTool(context: ToolRegistrationContext): void {
       outputSchema: resultOutputSchema(),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, ...input }) => {
+    async ({ workspaceId, workingDirectory, command: commandInput, timeout }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
       );
+      const command = mergeShellCommands(commandInput);
+      const input = { command, timeout };
       const response = await runShellTool(input, {
         cwd,
         root: workspace.root,

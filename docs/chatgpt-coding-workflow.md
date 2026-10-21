@@ -161,6 +161,7 @@ The Claude surface exposes these tool names:
 
 - `open_workspace`
 - `read`
+- `search_workspace_context`
 - `write`
 - `edit`
 - `bash`
@@ -170,6 +171,7 @@ DevSpace uses the Codex-style surface by default. It exposes:
 
 - `open_workspace`
 - `read`
+- `search_workspace_context`
 - `apply_patch`
 - `exec_command`
 - `write_stdin`
@@ -183,6 +185,22 @@ Both `exec_command.cmd` and Claude-mode `bash.command` accept either one
 command string or a non-empty array of command strings. Array entries execute
 in order inside one shell process, so they share shell state and produce one
 combined result/session.
+
+### Cached workspace context search
+
+Call `search_workspace_context` with the existing `workspace_id` and a
+`query` such as `networking` or `联机`. It returns readable paths for
+matching project `AGENT.md`, `AGENTS.md`, `CLAUDE.md`, and available
+skills, with `kind`, `name`, and `description`. Open the matching path with
+`read` before applying its rules.
+
+The server shares the index across conversations that open the same directory.
+An in-memory index avoids repeated directory discovery. A ten-minute path-only
+snapshot under the DevSpace state directory survives a service restart without
+duplicating instructions or other file contents. The first text search lazily
+indexes small instruction and skill files in memory. Edits through DevSpace
+file tools invalidate changed instruction/skill indexes; after external shell
+or editor changes, use `refresh: true` to rediscover immediately.
 
 Set `tools.mode` to `claude` in `~/.devspace/config.jsonc` to expose `write`,
 `edit`, and `bash` instead of the Codex mutation and command tools. Dedicated

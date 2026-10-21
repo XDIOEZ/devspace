@@ -28,11 +28,11 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }> = [
     {
       mode: "claude",
-      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes"],
+      expected: ["open_workspace", "read", "search_workspace_context", "write", "edit", "bash", "show_changes"],
     },
     {
       mode: "codex",
-      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes"],
+      expected: ["open_workspace", "read", "search_workspace_context", "apply_patch", "exec_command", "write_stdin", "show_changes"],
     },
   ];
 
@@ -47,6 +47,75 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
       );
     });
   }
+});
+
+test("workspace context search reuses paths, matches file text and refreshes on demand", async (t) => {
+  const { client, project } = await fixture(t, { toolMode: "claude", uiEnabled: false });
+  const workspaceId = structuredContent(await callOpen(client, project)).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  const lookup = async (query: string, refresh = false) =>
+    structuredContent(await client.callTool({
+      name: "search_workspace_context",
+      arguments: { workspace_id: workspaceId, query, refresh },
+    }));
+  const initial = await lookup("project instructions");
+  assert.equal(initial.cache_hit, true);
+  assert.deepEqual((initial.matches as Array<{ path: string }>).map(({ path }) => path), ["AGENTS.md"]);
+
+  const nested = join(project, "networking");
+  const skillDir = join(project, ".agents", "skills", "sync-guide");
+  await mkdir(nested, { recursive: true });
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(join(nested, "AGENT.md"), "multiplayer replication checklist\n");
+  await writeFile(join(skillDir, "SKILL.md"), [
+    "---",
+    "name: sync-guide",
+    "description: Multiplayer entity replication guidance.",
+    "---",
+    "Validate netcode updates.",
+  ].join("\n"));
+
+  const stale = await lookup("multiplayer");
+  assert.equal(stale.total_matches, 0);
+  const refreshed = await lookup("multiplayer", true);
+  assert.equal(refreshed.cache_hit, false);
+  const matches = refreshed.matches as Array<{ kind: string; path: string }>;
+  assert.equal(matches.length, 2);
+  assert.ok(matches.some(({ kind, path }) => kind === "skill" && path.replace(/\\/g, "/").endsWith("/sync-guide/SKILL.md")));
+  assert.ok(matches.some(({ kind, path }) => kind === "instruction" && path === "networking/AGENT.md"));
+
+  const cached = await lookup("replication");
+  assert.equal(cached.cache_hit, true);
+  assert.equal(cached.total_matches, 2);
+  const instruction = await client.callTool({
+    name: "read",
+    arguments: { workspace_id: workspaceId, path: "networking/AGENT.md" },
+  });
+  assert.equal(instruction.isError, undefined);
+});
+
+test("editing a project instruction invalidates the workspace context index", async (t) => {
+  const { client, project } = await fixture(t, { toolMode: "claude", uiEnabled: false });
+  const workspaceId = structuredContent(await callOpen(client, project)).workspace_id;
+  const search = async (query: string) =>
+    structuredContent(await client.callTool({
+      name: "search_workspace_context",
+      arguments: { workspace_id: workspaceId, query },
+    }));
+  assert.equal((await search("new_search_keyword")).total_matches, 0);
+  const result = await client.callTool({
+    name: "write",
+    arguments: {
+      workspace_id: workspaceId,
+      path: "AGENTS.md",
+      content: "new_search_keyword in instructions\n",
+    },
+  });
+  assert.equal(result.isError, undefined);
+  const newMatch = await search("new_search_keyword");
+  assert.equal(newMatch.cache_hit, false);
+  assert.equal(newMatch.total_matches, 1);
 });
 
 test("command tools accept multiple commands in one call", async (t) => {

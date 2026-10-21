@@ -78,6 +78,8 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
         return response;
       }
 
+      await workspaces.invalidateContextForPaths(workspace, [input.path]);
+
       logToolCall(config, {
         tool: toolNames.write,
         workspaceId,
@@ -151,6 +153,8 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
         );
         return response;
       }
+
+      await workspaces.invalidateContextForPaths(workspace, [input.path]);
 
       const stats = countDiffStats(
         response.details?.patch ?? response.details?.diff,

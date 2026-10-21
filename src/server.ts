@@ -134,7 +134,7 @@ function serverInstructions(
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches one, use ${toolNames.read} with the returned skill path before proceeding. `
     : "";
   const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in available_agents_files, use ${toolNames.read} to inspect that instruction file and follow it. `;
-  const common = `Call ${toolNames.openWorkspace} when starting work in a project folder or isolated worktree without a usable workspace_id, then reuse the returned workspace_id for subsequent operations in that workspace.`;
+  const common = `Call ${toolNames.openWorkspace} when starting work in a project folder or isolated worktree without a usable workspace_id, then reuse the returned workspace_id for subsequent operations in that workspace. Use search_workspace_context with keywords to find project instruction and skill paths without repeatedly scanning the project.`;
 
   return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
 }
@@ -618,6 +618,66 @@ function registerMcpSurface(
             : {}),
           instruction,
         },
+      };
+    },
+  );
+
+  registrationTarget.registerTool(
+    "search_workspace_context",
+    {
+      title: "Search cached workspace context",
+      description:
+        "Search this workspace's cached AGENTS.md, CLAUDE.md and SKILL.md index by keyword (including instruction/skill text), returning paths to read. The index is shared across conversations and stored as a short-lived path-only snapshot. Use refresh=true after external changes.",
+      inputSchema: {
+        workspace_id: z.string().describe(workspaceIdDescription),
+        query: z.string().trim().min(1).max(200)
+          .describe("Keywords to match against instruction and skill names, paths, descriptions, or text."),
+        limit: z.number().int().min(1).max(30).optional()
+          .describe("Maximum matching paths to return. Defaults to 10."),
+        refresh: z.boolean().optional()
+          .describe("Force the workspace's instruction and skill index to be rebuilt."),
+      },
+      outputSchema: {
+        workspace_id: z.string(),
+        root: z.string(),
+        indexed_at: z.string(),
+        cache_hit: z.boolean(),
+        total_matches: z.number().int().nonnegative(),
+        matches: z.array(z.object({
+          kind: z.enum(["skill", "instruction"]),
+          name: z.string(),
+          description: z.string(),
+          path: z.string(),
+        })),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspace_id, query, limit, refresh }) => {
+      const startedAt = performance.now();
+      const result = await workspaces.searchWorkspaceContext(
+        workspace_id, query, limit, refresh,
+      );
+      logToolCall(config, {
+        tool: "search_workspace_context",
+        workspaceId: workspace_id,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      const fields = {
+        workspace_id: result.workspaceId,
+        root: result.root,
+        indexed_at: result.indexedAt,
+        cache_hit: result.cacheHit,
+        total_matches: result.totalMatches,
+        matches: result.matches,
+      };
+      return {
+        content: [textBlock(
+          result.matches.length > 0
+            ? result.matches.map((match) => `${match.kind}: ${match.name} — ${match.path}`).join("\n")
+            : "No matching instruction or skill paths. Try different keywords or refresh=true.",
+        )],
+        structuredContent: fields,
       };
     },
   );

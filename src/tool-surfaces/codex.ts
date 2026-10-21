@@ -120,6 +120,11 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           return applyPatch(workspace.root, patch);
         },
       );
+      const workspace = await workspaces.getWorkspace(workspaceId);
+      await workspaces.invalidateContextForPaths(
+        workspace,
+        applied.files.flatMap((file) => [file.path, file.previousPath].filter((path): path is string => Boolean(path))),
+      );
       const paths = applied.files.map((file) => file.path).join(", ");
       const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
       const content = [textBlock(result)];

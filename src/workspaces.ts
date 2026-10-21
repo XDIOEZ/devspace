@@ -28,11 +28,17 @@ import {
   resolvePathInsideCanonicalRoot,
 } from "./roots.js";
 import {
-  loadWorkspaceSkills,
+  formatPathForPrompt,
   resolveSkillReadPath,
   type LoadedSkills,
   type SkillReadResolution,
 } from "./skills.js";
+import {
+  isContextFilePath,
+  WorkspaceContextCache,
+  type WorkspaceContextIndex,
+  type WorkspaceContextMatch,
+} from "./workspace-context-cache.js";
 import {
   loadLocalAgentProfiles,
   type LocalAgentProfile,
@@ -81,6 +87,15 @@ export interface WorkspaceReadPath {
   skillRead?: SkillReadResolution;
 }
 
+export interface WorkspaceContextSearchResult {
+  workspaceId: string;
+  root: string;
+  cacheHit: boolean;
+  indexedAt: string;
+  totalMatches: number;
+  matches: WorkspaceContextMatch[];
+}
+
 type InitialAgentsFileSource = "global" | "workspace";
 
 export interface OpenWorkspaceInput {
@@ -104,7 +119,7 @@ const MAX_CACHED_WORKSPACES = 32;
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
-  private readonly pendingInstructionScans = new Map<string, Promise<string[]>>();
+  private readonly contextCache: WorkspaceContextCache;
   private readonly pendingRestores = new Map<
     string,
     Promise<BetterResult<void, ManagedWorktreeFeatureError>>
@@ -113,7 +128,9 @@ export class WorkspaceRegistry {
   constructor(
     private readonly config: ServerConfig,
     private readonly store?: WorkspaceStore,
-  ) {}
+  ) {
+    this.contextCache = new WorkspaceContextCache(config, (root) => discoverInstructionPaths(root, config));
+  }
 
   async openWorkspace(
     input: string | OpenWorkspaceInput,
@@ -247,6 +264,8 @@ export class WorkspaceRegistry {
   }
 
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
+    const { index } = await this.contextCache.get(workspace.root);
+    Object.assign(workspace, this.skillsFromIndex(index));
     workspace.agentProfiles = await loadLocalAgentProfiles(this.config, workspace.root);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
@@ -315,6 +334,7 @@ export class WorkspaceRegistry {
       if (!touched.value) throw unavailableWorkspaceError(workspaceId);
     }
 
+    const { index } = await this.contextCache.get(root);
     const restoredWorkspace: Workspace = {
       id: session.id,
       root,
@@ -332,7 +352,7 @@ export class WorkspaceRegistry {
               managed: session.managed,
             }
           : undefined,
-      ...this.loadSkillsForWorkspace(root),
+      ...this.skillsFromIndex(index),
       agentProfiles: [],
     };
     this.rememberWorkspace(restoredWorkspace);
@@ -443,6 +463,53 @@ export class WorkspaceRegistry {
     return workingDirectory ? this.resolvePath(workspace, workingDirectory) : workspace.root;
   }
 
+  /** Search already-indexed skill and instruction paths without scanning the project tree per query. */
+  async searchWorkspaceContext(
+    workspaceId: string,
+    query: string,
+    limit = 10,
+    refresh = false,
+  ): Promise<WorkspaceContextSearchResult> {
+    const workspace = await this.getWorkspace(workspaceId);
+    const { index, cacheHit } = await this.contextCache.get(workspace.root, refresh);
+    Object.assign(workspace, this.skillsFromIndex(index));
+
+    // A root AGENTS.md ignored by Git may still be part of the initial context.
+    const initial = await this.loadInitialAgentsFiles(workspace.root);
+    for (const file of initial) {
+      if (!isPathInsideRoot(file.path, workspace.root)) continue;
+      if (index.instructionPaths.includes(file.path)) continue;
+      index.instructionPaths.push(file.path);
+      index.searchText = undefined;
+    }
+    const { matches, totalMatches } = await this.contextCache.search(
+      index,
+      workspace.root,
+      workspace.canonicalRoot,
+      query,
+      limit,
+    );
+    return {
+      workspaceId: workspace.id,
+      root: workspace.root,
+      cacheHit,
+      indexedAt: new Date(index.indexedAt).toISOString(),
+      totalMatches,
+      matches: matches.map((match) => ({
+        ...match,
+        path: match.kind === "skill"
+          ? formatPathForPrompt(match.path)
+          : formatAgentsPath(match.path, workspace.root),
+      })),
+    };
+  }
+
+  async invalidateContextForPaths(workspace: Workspace, paths: string[]): Promise<void> {
+    if (paths.some(isContextFilePath)) {
+      await this.contextCache.invalidate(workspace.root);
+    }
+  }
+
   private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
     const canonicalRoot = await resolveCanonicalAllowedPath(
@@ -491,6 +558,7 @@ export class WorkspaceRegistry {
     sourceRoot?: string;
     worktree?: WorkspaceWorktree;
   }): Promise<WorkspaceContext> {
+    const { index } = await this.contextCache.get(input.root);
     const workspace: Workspace = {
       id: `ws_${randomBytes(5).toString("hex")}`,
       root: input.root,
@@ -498,7 +566,7 @@ export class WorkspaceRegistry {
       mode: input.mode,
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
-      ...this.loadSkillsForWorkspace(input.root),
+      ...this.skillsFromIndex(index),
       agentProfiles: await loadLocalAgentProfiles(this.config, input.root),
     };
 
@@ -536,8 +604,8 @@ export class WorkspaceRegistry {
     }
   }
 
-  private loadSkillsForWorkspace(root: string): Pick<Workspace, "skills" | "skillDiagnostics"> {
-    const result = loadWorkspaceSkills(this.config, root);
+  private skillsFromIndex(index: WorkspaceContextIndex): Pick<Workspace, "skills" | "skillDiagnostics"> {
+    const result = index.loadedSkills;
     return {
       skills: result.skills,
       skillDiagnostics: result.diagnostics,
@@ -623,10 +691,11 @@ export class WorkspaceRegistry {
     }
     const discovered: AvailableAgentsFile[] = [];
 
-    for (const path of await this.discoverInstructionPaths(root)) {
+    const canonicalRoot = (await tryRealpath(root)) ?? root;
+    for (const path of (await this.contextCache.get(root)).index.instructionPaths) {
       if (loadedPaths.has(path)) continue;
       const realPath = await tryRealpath(path);
-      if (!realPath || loadedRealPaths.has(realPath)) continue;
+      if (!realPath || !isPathInsideRoot(realPath, canonicalRoot) || loadedRealPaths.has(realPath)) continue;
 
       discovered.push({ path });
     }
@@ -634,19 +703,6 @@ export class WorkspaceRegistry {
     return discovered.sort((a, b) => a.path.localeCompare(b.path));
   }
 
-  // Share simultaneous scans without retaining stale results after project instructions change.
-  private async discoverInstructionPaths(root: string): Promise<string[]> {
-    const key = await canonicalPath(root);
-    const pending = this.pendingInstructionScans.get(key);
-    if (pending) return pending;
-    const scan = discoverInstructionPaths(root, this.config);
-    this.pendingInstructionScans.set(key, scan);
-    try {
-      return await scan;
-    } finally {
-      this.pendingInstructionScans.delete(key);
-    }
-  }
 }
 
 // Let Git prune ignored trees while preserving tracked instructions, including ignored tracked files.
@@ -713,7 +769,7 @@ export async function ensureCheckoutWorkspaceRoot(
   return await ops.stat(path);
 }
 
-const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
+const CONTEXT_FILE_NAMES = new Set(["AGENT.md", "AGENT.MD", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
 const SKIPPED_CONTEXT_DIRS = new Set([
   ".git",
   ".hg",

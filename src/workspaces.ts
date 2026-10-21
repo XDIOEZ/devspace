@@ -705,7 +705,7 @@ export class WorkspaceRegistry {
 
 }
 
-// Let Git prune ignored trees while preserving tracked instructions, including ignored tracked files.
+// Avoid generated/dependency directories even when a repository does not ignore them.
 async function discoverInstructionPaths(root: string, config: ServerConfig): Promise<string[]> {
   const startedAt = performance.now();
   let method = "directory_walk";
@@ -721,13 +721,19 @@ async function discoverInstructionPaths(root: string, config: ServerConfig): Pro
       method = "git_ls_files";
       try {
         const result = await git(root, [
-          "ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z", "--",
-          ...Array.from(CONTEXT_FILE_NAMES, (name) => `:(glob)**/${name}`),
+          "ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z",
+          ...SKIPPED_CONTEXT_DIRS.flatMap((name) => [
+            `--exclude=${name}/`,
+            ...(name.toLowerCase() === name ? [] : [`--exclude=${name.toLowerCase()}/`]),
+          ]),
+          "--",
+          ...CONTEXT_FILE_NAMES.map((name) => `:(icase,glob)**/${name}`),
+          ...SKIPPED_CONTEXT_DIRS.map((name) => `:(exclude,icase,glob)**/${name}/**`),
         ]);
         const gitRoot = (await git(root, ["rev-parse", "--show-toplevel"])).stdout.trim();
         paths = [...new Set(result.stdout.split("\0").filter(Boolean))]
           .map((path) => resolve(gitRoot, path))
-          .filter((path) => isPathInsideRoot(path, root));
+          .filter((path) => isPathInsideRoot(path, root) && !isInSkippedContextDir(root, path));
         return paths;
       } catch (error) {
         logEvent(config.logging, "warn", "workspace_instruction_scan_fallback", {
@@ -737,7 +743,7 @@ async function discoverInstructionPaths(root: string, config: ServerConfig): Pro
       }
     }
     await walkWorkspace(root, (path, entry) => {
-      if (entry.isFile() && CONTEXT_FILE_NAMES.has(entry.name)) paths.push(path);
+      if (entry.isFile() && CONTEXT_FILE_NAMES_SET.has(entry.name.toLowerCase())) paths.push(path);
     });
     return paths;
   } finally {
@@ -769,8 +775,10 @@ export async function ensureCheckoutWorkspaceRoot(
   return await ops.stat(path);
 }
 
-const CONTEXT_FILE_NAMES = new Set(["AGENT.md", "AGENT.MD", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
-const SKIPPED_CONTEXT_DIRS = new Set([
+const CONTEXT_FILE_NAMES = ["AGENT.md", "AGENTS.md", "CLAUDE.md"];
+const CONTEXT_FILE_NAMES_SET = new Set(CONTEXT_FILE_NAMES.map((name) => name.toLowerCase()));
+const SKIPPED_CONTEXT_DIRS = [
+  // Version control, build outputs and JavaScript dependencies.
   ".git",
   ".hg",
   ".svn",
@@ -778,10 +786,43 @@ const SKIPPED_CONTEXT_DIRS = new Set([
   "node_modules",
   "dist",
   "build",
+  "Builds",
   ".next",
+  ".nuxt",
+  ".svelte-kit",
   ".turbo",
   ".cache",
-]);
+  ".parcel-cache",
+  "coverage",
+  // Unity / Unreal generated data. Assets, Packages and source directories stay searchable.
+  "Library",
+  "Temp",
+  "obj",
+  "Logs",
+  "MemoryCaptures",
+  "UserSettings",
+  "Intermediate",
+  "DerivedDataCache",
+  "Binaries",
+  // Common language-specific dependency and compiler caches.
+  "vendor",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".gradle",
+  "target",
+  ".vs",
+  "Pods",
+] as const;
+const SKIPPED_CONTEXT_DIRS_SET = new Set(SKIPPED_CONTEXT_DIRS.map((name) => name.toLowerCase()));
+
+function isInSkippedContextDir(root: string, path: string): boolean {
+  const parts = relative(root, path).split(sep);
+  return parts.slice(0, -1).some((part) => SKIPPED_CONTEXT_DIRS_SET.has(part.toLowerCase()));
+}
 
 export function formatAgentsPath(path: string, workspaceRoot: string | undefined): string {
   if (!workspaceRoot) return path.split(sep).join("/");
@@ -851,7 +892,7 @@ async function walkWorkspace(
   for await (const entry of entries) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) {
-      if (!SKIPPED_CONTEXT_DIRS.has(entry.name)) {
+      if (!SKIPPED_CONTEXT_DIRS_SET.has(entry.name.toLowerCase())) {
         await walkWorkspace(path, visit);
       }
       continue;

@@ -202,6 +202,13 @@ indexes small instruction and skill files in memory. Edits through DevSpace
 file tools invalidate changed instruction/skill indexes; after external shell
 or editor changes, use `refresh: true` to rediscover immediately.
 
+On a cache miss, both Git discovery and filesystem traversal skip generated
+or dependency trees such as Unity `Library`, `Temp`, `obj`, `Logs`,
+`node_modules`, `.venv`, and `vendor`, including tracked generated files.
+Real Unity source trees such as `Assets` and `Packages` are still searched.
+The cache version invalidates older snapshots whenever these discovery rules
+change.
+
 Set `tools.mode` to `claude` in `~/.devspace/config.jsonc` to expose `write`,
 `edit`, and `bash` instead of the Codex mutation and command tools. Dedicated
 MCP tools for `grep`, `glob`, and `ls` are not registered in either mode; use

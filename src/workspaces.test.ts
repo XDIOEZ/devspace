@@ -48,6 +48,62 @@ test("a checkout exposes initial and nested instruction context", async (t) => {
 
 });
 
+test("non-Git workspaces skip generated Unity and dependency directories", async (t) => {
+  const { root, registry } = await fixture(t);
+  for (const directory of [
+    "Library/PackageCache",
+    "Temp",
+    "OBJ",
+    "Logs",
+    "node_modules/third-party",
+    ".venv/lib",
+    "Intermediate",
+    "vendor/dependency",
+  ]) {
+    const path = join(root, directory);
+    await mkdir(path, { recursive: true });
+    await writeFile(join(path, "AGENTS.md"), "generated dependency context\n");
+  }
+  for (const directory of ["Assets/Scripts", "Packages/com.example.game", "Source"]) {
+    const path = join(root, directory);
+    await mkdir(path, { recursive: true });
+    await writeFile(join(path, "AGENTS.md"), "legitimate project context\n");
+  }
+
+  const opened = await registry.openWorkspace(root);
+  assert.deepEqual(
+    opened.availableAgentsFiles.map((file) => file.path),
+    [
+      join(root, "Assets", "Scripts", "AGENTS.md"),
+      join(root, "Packages", "com.example.game", "AGENTS.md"),
+      join(root, "Source", "AGENTS.md"),
+      join(root, "nested", "AGENTS.md"),
+    ].sort((a, b) => a.localeCompare(b)),
+  );
+});
+
+test("Git instruction discovery excludes tracked and untracked generated directories", async (t) => {
+  const { root, registry } = await fixture(t);
+  const gitRoot = await createGitProject(root);
+  const trackedGenerated = join(gitRoot, "Library", "PackageCache");
+  const trackedProject = join(gitRoot, "Assets", "Scripts");
+  const untrackedGenerated = join(gitRoot, "Temp");
+  const untrackedProject = join(gitRoot, "Packages", "com.example.game");
+  for (const directory of [trackedGenerated, trackedProject, untrackedGenerated, untrackedProject]) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, "AGENTS.md"), "instruction\n");
+  }
+  // Force-add the generated file to verify that tracked artifacts are skipped too.
+  await git(gitRoot, ["add", "-f", "Library/PackageCache/AGENTS.md", "Assets/Scripts/AGENTS.md"]);
+
+  const opened = await registry.openWorkspace(gitRoot);
+  assert.deepEqual(
+    opened.availableAgentsFiles.map((file) => file.path),
+    [join(trackedProject, "AGENTS.md"), join(untrackedProject, "AGENTS.md")]
+      .sort((a, b) => a.localeCompare(b)),
+  );
+});
+
 test("global instruction symlinks may target user-managed files outside agentDir", {
   skip: platform() === "win32",
 }, async (t) => {

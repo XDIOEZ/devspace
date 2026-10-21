@@ -5,7 +5,8 @@ import type { ServerConfig } from "./config.js";
 import { isPathInsideRoot } from "./roots.js";
 import { loadWorkspaceSkills, type LoadedSkills } from "./skills.js";
 
-const CACHE_VERSION = 1;
+// Bump when discovery rules change so old snapshots cannot reintroduce excluded paths.
+const CACHE_VERSION = 2;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_CACHED_ROOTS = 32;
 const MAX_SEARCH_FILE_BYTES = 128 * 1024;

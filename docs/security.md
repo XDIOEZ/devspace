@@ -96,7 +96,7 @@ sessions.
 
 Native file download is an opt-in, one-shot transfer into an already-open
 workspace. `download_artifact` accepts the MCP host's native file value, the
-`workspaceId` returned by `open_workspace`, and an unused relative destination
+`workspace_id` returned by `open_workspace`, and an unused relative destination
 path. It returns only the workspace-relative path and does not create a
 persistent artifact service or reusable artifact ID.
 
@@ -106,8 +106,14 @@ credentials, malformed references, and unknown object fields are rejected.
 
 Absolute paths, traversal, symlinked parents, and existing destinations also
 fail closed. Downloads stream under the configured per-file limit and are
-published without overwrite as owner-only files. DevSpace does not extract or
-execute transferred content.
+published without overwrite. On Linux, destination traversal stays anchored to
+opened directory descriptors. On macOS, traversal, inspection, cleanup, and
+publication use descriptor-relative filesystem operations against pinned
+directories. On Windows, DevSpace holds native directory handles without
+delete sharing, rejects reparse points, and keeps those handles open while Node
+performs the path-based write and publication operations. On POSIX systems the
+partial is created with mode `0600`; Windows permissions follow inherited ACLs.
+DevSpace does not extract or execute transferred content.
 
 ## Logs
 

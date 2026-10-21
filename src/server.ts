@@ -6,9 +6,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { createMcpHandler } from "@modelcontextprotocol/server";
+import { toNodeHandler } from "@modelcontextprotocol/node";
 import {
   registerAppResource,
   registerAppTool,
@@ -30,19 +30,21 @@ import {
   logEvent,
   requestIp,
   requestPath,
-  sessionIdPrefix,
 } from "./logger.js";
 import { readFileTool } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
-  McpSessionRegistry,
-  type McpSessionCloseResult,
-} from "./mcp-sessions.js";
+  compileMcpRegistrationSurface,
+  createModernMcpServerAdapter,
+  modernMcpAdapterErrorLogFields,
+  type McpRegistrationTarget,
+} from "./mcp-modern-server.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
-import { openAiConversationScopeId } from "./request-meta.js";
+import { conversationScopeIdFromRequestMeta } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
+import { DEVSPACE_VERSION } from "./version.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
@@ -71,18 +73,43 @@ import {
   type ToolSurface,
 } from "./tool-surfaces/types.js";
 
-type Transport = StreamableHTTPServerTransport;
-// MCP clients can reconnect without closing the previous transport. Bound stale
-// session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
+
+function mcpServerInfo() {
+  return {
+    name: "devspace",
+    title: "DevSpace",
+    version: DEVSPACE_VERSION,
+    description:
+      "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspace_id.",
+  };
+}
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: ServerConfig;
   localAgentProviders: LocalAgentProviderStatus[];
   close(): Promise<void>;
+}
+
+type TrackToolActivity = <T>(operation: () => Promise<T>) => Promise<T>;
+
+class ToolActivityTracker {
+  private readonly active = new Set<Promise<unknown>>();
+
+  readonly track: TrackToolActivity = <T>(operation: () => Promise<T>): Promise<T> => {
+    const promise = operation();
+    this.active.add(promise);
+    const remove = () => this.active.delete(promise);
+    void promise.then(remove, remove);
+    return promise;
+  };
+
+  async waitForIdle(): Promise<void> {
+    while (this.active.size > 0) {
+      await Promise.allSettled(Array.from(this.active));
+    }
+  }
 }
 
 interface WorkspaceAppManifestEntry {
@@ -99,15 +126,15 @@ function serverInstructions(
 ): string {
   const artifactInstruction =
     config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
-      ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
+      ? " When the user provides an attached or generated file that needs to be added to the workspace, pass the provided file directly to download_artifact with the existing workspace_id and a suitable relative destination path. Do not reconstruct attached files manually."
       : "";
   const showChangesInstruction =
-    " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change.";
+    " If files are modified, call show_changes once after the final related change and before the final response.";
   const skills = config.skillsEnabled
-    ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
+    ? `When ${toolNames.openWorkspace} returns available skills and a task matches one, use ${toolNames.read} with the returned skill path before proceeding. `
     : "";
-  const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
-  const common = `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected.`;
+  const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in available_agents_files, use ${toolNames.read} to inspect that instruction file and follow it. `;
+  const common = `Call ${toolNames.openWorkspace} when starting work in a project folder or isolated worktree without a usable workspace_id, then reuse the returned workspace_id for subsequent operations in that workspace.`;
 
   return `${common} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
 }
@@ -285,23 +312,46 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  trackToolActivity?: TrackToolActivity,
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
-    {
-      name: "devspace",
-      title: "DevSpace",
-      version: "0.1.0",
-      description:
-        "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspaceId.",
-    },
+    mcpServerInfo(),
     {
       instructions: serverInstructions(config, toolSurface),
     },
   );
 
-  registerAppResource(
+  registerMcpSurface(
     server,
+    config,
+    workspaces,
+    reviewCheckpoints,
+    processSessions,
+    resolveLocalAgentProviders,
+    incomingArtifactAdapters,
+    trackToolActivity,
+  );
+  return server;
+}
+
+function registerMcpSurface(
+  server: McpRegistrationTarget,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
+  processSessions: ProcessSessionManager,
+  resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
+  incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  trackToolActivity?: TrackToolActivity,
+): void {
+  const registrationTarget = trackToolActivity
+    ? withTrackedToolHandlers(server, trackToolActivity)
+    : server;
+  const toolSurface = getToolSurface(config.toolMode);
+
+  registerAppResource(
+    registrationTarget,
     "DevSpace Diff Card",
     WORKSPACE_APP_URI,
     {
@@ -332,12 +382,12 @@ export function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    registrationTarget,
     "open_workspace",
     {
       title: "Open workspace",
       description:
-        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+        "Start work in a project directory or isolated worktree when no usable workspace_id exists for it. During continued work, reuse the existing workspace_id instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
       inputSchema: {
         path: z
           .string()
@@ -350,32 +400,32 @@ export function createMcpServer(
           .describe(
             "Defaults to checkout, which works in the actual directory. Use worktree for isolated or parallel Git work.",
           ),
-        baseRef: z
+        base_ref: z
           .string()
           .optional()
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
       },
       outputSchema: {
-        workspaceId: z.string(),
+        workspace_id: z.string(),
         root: z.string(),
         mode: z.enum(["checkout", "worktree"]),
-        sourceRoot: z.string().optional(),
+        source_root: z.string().optional(),
         worktree: z
           .object({
             path: z.string(),
-            baseRef: z.string(),
-            baseSha: z.string(),
-            dirtySource: z.boolean(),
+            base_ref: z.string(),
+            base_sha: z.string(),
+            dirty_source: z.boolean(),
             detached: z.boolean(),
             managed: z.boolean(),
           })
           .optional(),
-        agentsFiles: z.array(workspaceAgentsFileOutputSchema).optional(),
-        availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema).optional(),
+        agents_files: z.array(workspaceAgentsFileOutputSchema).optional(),
+        available_agents_files: z.array(workspaceAvailableAgentsFileOutputSchema).optional(),
         skills: z.array(workspaceSkillOutputSchema).optional(),
-        agentProviders: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
+        agent_providers: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
-        skillDiagnostics: z.array(z.unknown()).optional(),
+        skill_diagnostics: z.array(z.unknown()).optional(),
         review: z.discriminatedUnion("available", [
           z.object({ available: z.literal(true) }),
           z.object({
@@ -388,8 +438,9 @@ export function createMcpServer(
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, baseRef }, { _meta }) => {
+    async ({ path, mode, base_ref }, { _meta }) => {
       const startedAt = performance.now();
+      const baseRef = base_ref;
       const {
         workspace,
         agentsFiles,
@@ -398,7 +449,7 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: openAiConversationScopeId(_meta) },
+        { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
       );
       const contextReadyAt = performance.now();
       logEvent(config.logging, "info", "workspace_open_phase", {
@@ -413,8 +464,15 @@ export function createMcpServer(
         workspaceId: workspace.id, phase: "review_checkpoint", available: review.available,
         durationMs: Math.round(performance.now() - contextReadyAt),
       });
+      const preloadSubagents = config.subagents.enabled
+        && config.subagents.instructions === "preload";
+      const subagentsSkill = workspace.skills.find((skill) => skill.name === "subagents");
+      const preloadedSubagentInstructions = preloadSubagents && subagentsSkill
+        ? readFileSync(subagentsSkill.filePath, "utf8")
+        : undefined;
       const cardSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
+        .filter((skill) => !(preloadSubagents && skill.name === "subagents"))
         .map((skill) => ({
           name: skill.name,
           description: skill.description,
@@ -447,17 +505,24 @@ export function createMcpServer(
       const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
       const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
       const cardInstruction = config.skillsEnabled
-        ? "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
-      const instruction = workspaceReused
+        ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
+        : "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file.";
+      const workspaceInstruction = workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
-            "Continue with this workspaceId.",
+            "Continue with this workspace_id.",
             "Keep following the project instructions, nested instruction files, skills, agent profiles, and diagnostics already provided for this workspace.",
           ].join("\n\n")
         : workspace.mode === "worktree"
-          ? "Use this workspaceId for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
+          ? "Use this workspace_id for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
           : cardInstruction;
+      const instruction = preloadedSubagentInstructions && includeBootstrapContext
+        ? [
+            workspaceInstruction,
+            "Subagent workflow instructions:",
+            preloadedSubagentInstructions,
+          ].join("\n\n")
+        : workspaceInstruction;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -526,20 +591,29 @@ export function createMcpServer(
           },
         },
         structuredContent: {
-          workspaceId: workspace.id,
+          workspace_id: workspace.id,
           root: workspace.root,
           mode: workspace.mode,
-          sourceRoot: workspace.sourceRoot,
-          worktree: workspace.worktree,
+          source_root: workspace.sourceRoot,
+          worktree: workspace.worktree
+            ? {
+                path: workspace.worktree.path,
+                base_ref: workspace.worktree.baseRef,
+                base_sha: workspace.worktree.baseSha,
+                dirty_source: workspace.worktree.dirtySource,
+                detached: workspace.worktree.detached,
+                managed: workspace.worktree.managed,
+              }
+            : undefined,
           review,
           ...(includeBootstrapContext
             ? {
-                agentsFiles: loadedAgentsFiles,
-                availableAgentsFiles: availableAgentsFileOutputs,
+                agents_files: loadedAgentsFiles,
+                available_agents_files: availableAgentsFileOutputs,
                 skills: visibleSkills,
-                agentProviders: visibleAgentProviders,
+                agent_providers: visibleAgentProviders,
                 agents: visibleAgents,
-                skillDiagnostics: workspace.skillDiagnostics,
+                skill_diagnostics: workspace.skillDiagnostics,
               }
             : {}),
           instruction,
@@ -548,29 +622,29 @@ export function createMcpServer(
     },
   );
 
-  server.registerTool(
+  registrationTarget.registerTool(
     toolNames.read,
     {
       title: "Read file",
       description:
         [
-          "Read a file in a workspace. Use this for file inspection instead of shell commands like cat or sed.",
+          "Read all or part of a file in a workspace.",
           "Use this tool to inspect relevant AGENTS.md or CLAUDE.md files listed by open_workspace before working in nested directories.",
           config.skillsEnabled
-            ? "If available skills were returned and a task matches one, read that skill's path before proceeding. Skill paths may be outside the workspace; only advertised SKILL.md files and files under already-loaded skill directories are readable."
+            ? "If available skills were returned and a task matches one, read the returned skill path before proceeding."
             : "",
         ]
           .filter(Boolean)
           .join(" "),
       inputSchema: {
-        workspaceId: z
+        workspace_id: z
           .string()
           .describe(workspaceIdDescription),
         path: z
           .string()
           .describe(
             config.skillsEnabled
-              ? "File path to read, relative to the workspace root. May also be an advertised skill path from open_workspace skills."
+              ? "File path relative to the workspace root, or a skill path returned by open_workspace."
               : "File path to read, relative to the workspace root.",
           ),
         offset: z
@@ -589,17 +663,14 @@ export function createMcpServer(
       outputSchema: resultOutputSchema(),
       annotations: { readOnlyHint: true },
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspace_id, ...input }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const readPath = workspaces.resolveReadPath(workspace, input.path);
+      const workspaceId = workspace_id;
+      const workspace = await workspaces.getWorkspace(workspaceId);
+      const readPath = await workspaces.resolveReadPath(workspace, input.path);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
-        {
-          cwd: workspace.root,
-          root: workspace.root,
-          readRoots: readPath.readRoots,
-        },
+        { cwd: workspace.root },
       );
 
       if (response.isError) {
@@ -610,7 +681,6 @@ export function createMcpServer(
         }, response.content, startedAt);
         return response;
       }
-      workspaces.markReadPathLoaded(workspace, readPath);
 
       logToolCall(config, {
         tool: toolNames.read,
@@ -630,32 +700,33 @@ export function createMcpServer(
   );
 
   toolSurface.register({
-    server,
+    server: registrationTarget,
     config,
     workspaces,
     processSessions,
   });
 
   registerAppTool(
-    server,
+    registrationTarget,
     "show_changes",
     {
       title: "Show changes",
       description:
         "Show the changes made in this turn for an open workspace. Call this once after the final related file change and before your final response so the user can review the combined diff. Do not call it after each individual file change.",
       inputSchema: {
-        workspaceId: z.string().describe(workspaceIdDescription),
+        workspace_id: z.string().describe(workspaceIdDescription),
       },
       outputSchema: resultOutputSchema({
-        workspaceId: z.string(),
-        reviewRef: z.string().regex(/^[0-9a-f]{40,64}$/),
+        workspace_id: z.string(),
+        review_ref: z.string().regex(/^[0-9a-f]{40,64}$/),
       }),
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
     },
-    async ({ workspaceId }, { _meta }) => {
+    async ({ workspace_id }, { _meta }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
+      const workspaceId = workspace_id;
+      const workspace = await workspaces.getWorkspace(workspaceId);
       const reviewRef = typeof _meta?.["devspace/reviewRef"] === "string"
         ? _meta["devspace/reviewRef"]
         : undefined;
@@ -692,8 +763,8 @@ export function createMcpServer(
           },
         },
         structuredContent: {
-          workspaceId,
-          reviewRef: review.reviewRef,
+          workspace_id: workspaceId,
+          review_ref: review.reviewRef,
           result: contentText(content),
         },
       };
@@ -701,14 +772,30 @@ export function createMcpServer(
   );
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
-    registerArtifactTools(server, {
+    registerArtifactTools(registrationTarget, {
       config,
       workspaces,
       incomingArtifactAdapters,
     });
   }
+}
 
-  return server;
+function withTrackedToolHandlers(
+  server: McpRegistrationTarget,
+  trackToolActivity: TrackToolActivity,
+): McpRegistrationTarget {
+  return {
+    registerTool: ((...args: unknown[]) => {
+      const handler = args.at(-1) as (...handlerArgs: unknown[]) => unknown;
+      return (server.registerTool as (...callArgs: unknown[]) => unknown)(
+        ...args.slice(0, -1),
+        (...handlerArgs: unknown[]) => trackToolActivity(
+          () => Promise.resolve(handler(...handlerArgs)),
+        ),
+      );
+    }) as McpRegistrationTarget["registerTool"],
+    registerResource: server.registerResource.bind(server),
+  };
 }
 
 export interface CreateServerOptions {
@@ -728,7 +815,6 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -741,45 +827,48 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const toolActivities = new ToolActivityTracker();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
-    getLocalAgentProviderAvailabilitySnapshot(),
+    getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
   );
   const resolveLocalAgentProviders = () => buildLocalAgentProviderStatuses(
     config.subagents,
-    getLocalAgentProviderAvailabilitySnapshot(),
+    getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
   );
-
-  const logSessionCloseResults = (
-    reason: "idle_timeout" | "server_shutdown",
-    results: McpSessionCloseResult[],
-  ) => {
-    for (const result of results) {
-      if (result.error) {
-        logEvent(config.logging, "warn", "mcp_session_close_failed", {
-          reason,
-          sessionIdPrefix: sessionIdPrefix(result.sessionId),
-          error:
-            result.error instanceof Error
-              ? result.error.message
-              : String(result.error),
-        });
-        continue;
-      }
-
-      logEvent(config.logging, "info", "mcp_session_closed", {
-        reason,
-        sessionIdPrefix: sessionIdPrefix(result.sessionId),
-      });
-    }
-  };
-
-  const sessionCleanupTimer = setInterval(() => {
-    void transports
-      .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
-      .then((results) => logSessionCloseResults("idle_timeout", results));
-  }, MCP_SESSION_CLEANUP_INTERVAL_MS);
-  sessionCleanupTimer.unref();
+  const modernToolSurface = getToolSurface(config.toolMode);
+  const bindModernMcpSurface = compileMcpRegistrationSurface((target) => {
+    registerMcpSurface(
+      target,
+      config,
+      workspaces,
+      reviewCheckpoints,
+      processSessions,
+      resolveLocalAgentProviders,
+      incomingArtifactAdapters,
+      toolActivities.track,
+    );
+  });
+  const logMcpHandlerError = (error: Error) => logEvent(
+    config.logging,
+    "error",
+    "mcp_handler_error",
+    modernMcpAdapterErrorLogFields(error),
+  );
+  const mcpHandler = createMcpHandler(() => {
+    const adapter = createModernMcpServerAdapter(
+      mcpServerInfo(),
+      { instructions: serverInstructions(config, modernToolSurface) },
+    );
+    bindModernMcpSurface(adapter.registrationTarget);
+    return adapter.server;
+  }, {
+    legacy: "stateless",
+    onerror: logMcpHandlerError,
+  });
+  const mcpNodeHandler = toNodeHandler(mcpHandler, {
+    onerror: logMcpHandlerError,
+  });
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", true);
@@ -840,8 +929,6 @@ export function createServer(
 
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
-    const sessionId = req.header("mcp-session-id");
-    const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
 
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
@@ -851,7 +938,7 @@ export function createServer(
     });
     if (res.headersSent) return;
 
-    if (!oauthProvider.acceptsResource(req.auth?.resource)) {
+    if (!req.auth?.resource || !oauthProvider.isResourceAllowed(req.auth.resource)) {
       logEvent(config.logging, "warn", "auth_denied", {
         requestId,
         method: req.method,
@@ -866,58 +953,10 @@ export function createServer(
     logEvent(config.logging, "debug", "mcp_request", {
       requestId,
       method: req.method,
-      sessionIdPresent: Boolean(sessionId),
-      sessionIdPrefix: sessionIdPrefix(sessionId),
-      isInitialize: initializeRequest,
     });
 
     try {
-      let transport: Transport | undefined;
-
-      if (sessionId) {
-        transport = transports.get(sessionId);
-        if (!transport) {
-          sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
-          return;
-        }
-      } else if (initializeRequest) {
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
-            logEvent(config.logging, "info", "mcp_session_created", {
-              requestId,
-              sessionIdPrefix: sessionIdPrefix(newSessionId),
-              ...requestLogFields(req, config),
-            });
-          },
-        });
-
-        transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
-          if (closedSessionId && transports.remove(closedSessionId)) {
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              reason: "transport_close",
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-            });
-          }
-        };
-
-        const server = createMcpServer(
-          config,
-          workspaces,
-          reviewCheckpoints,
-          processSessions,
-          resolveLocalAgentProviders,
-          incomingArtifactAdapters,
-        );
-        await server.connect(transport);
-      } else {
-        sendJsonRpcError(res, 400, -32000, "No valid MCP session");
-        return;
-      }
-
-      await transport.handleRequest(req, res, req.body);
+      await mcpNodeHandler(req, res, req.body);
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
@@ -936,9 +975,14 @@ export function createServer(
     localAgentProviders,
     close: () => {
       closePromise ??= (async () => {
-        clearInterval(sessionCleanupTimer);
-        const results = await transports.closeAll();
-        logSessionCloseResults("server_shutdown", results);
+        try {
+          await mcpHandler.close();
+        } catch (error) {
+          logEvent(config.logging, "warn", "mcp_handler_close_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        await toolActivities.waitForIdle();
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();

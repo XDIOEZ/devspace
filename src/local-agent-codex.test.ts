@@ -73,7 +73,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [] } } });
         return;
       }
-      const item = { type: "agentMessage", text: "fake response " + turn };
+      if (message.params.input[0].text === "notLoaded") {
+        const item = { type: "agentMessage", text: "CODEXOK" };
+        output({ method: "item/completed", params: { threadId: message.params.threadId, turnId, item } });
+        output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [], itemsView: "notLoaded" } } });
+        return;
+      }
+      const item = { type: "agentMessage", text: message.params.input[0].text === "policy"
+        ? JSON.stringify(message.params.sandboxPolicy)
+        : "fake response " + turn };
       output({ method: "item/completed", params: { threadId: message.params.threadId, turnId, item } });
       output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [item] } } });
     });
@@ -133,6 +141,23 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       assert.ok(protocolFailure.error.cause, "provider protocol cause remains available internally");
       assert.equal("cause" in toAgentErrorPayload(protocolFailure.error), false);
     }
+    const notLoaded = await runtime.run({
+      prompt: "notLoaded",
+      workspaceRoot: "/tmp/project",
+      providerSessionId: first.providerSessionId ?? undefined,
+    });
+    assert.equal(notLoaded.isOk(), true, "empty turn.items must fall back to item/completed stream items");
+    if (notLoaded.isErr()) throw notLoaded.error;
+    assert.equal(notLoaded.value.finalResponse, "CODEXOK");
+    const policy = await runtime.run({
+      prompt: "policy",
+      workspaceRoot: "/tmp/project",
+      writeMode: "allowed",
+      providerSessionId: first.providerSessionId ?? undefined,
+    });
+    assert.equal(policy.isOk(), true);
+    if (policy.isErr()) throw policy.error;
+    assert.deepEqual(JSON.parse(policy.value.finalResponse), { type: "workspaceWrite", networkAccess: true });
     await runtime.releaseSession("thread_new");
   } finally {
     await runtime.close();

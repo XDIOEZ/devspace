@@ -27,6 +27,8 @@ The setup flow asks one question at a time.
 
 First choose where you will use DevSpace: ChatGPT, Coding Agents, or both.
 DevSpace uses that answer to skip setup that does not apply to you.
+This selects where you invoke DevSpace from. It does not control which agents
+DevSpace may run for delegated work.
 
 ### Project roots
 
@@ -52,11 +54,15 @@ commands use the current Git project, or the current directory outside a
 repository, with the authority of your local shell. MCP workspace operations
 remain limited to the roots configured for ChatGPT.
 
-### Coding Agents
+### Subagents
 
-Setup detects supported Coding Agents and asks which ones DevSpace may use.
+Setup detects supported agents and asks which ones DevSpace may use as
+subagents. ChatGPT or another coding agent can delegate work through DevSpace
+to the agents selected here.
 These choices are stored as provider objects under `subagents` in
 `~/.devspace/config.jsonc`.
+
+### Coding Agents
 
 If you selected Coding Agents, setup prints:
 
@@ -65,8 +71,13 @@ npx skills add Waishnav/devspace --skill subagents --global
 ```
 
 The Skills CLI asks which installed Coding Agents should receive the skill.
-The skill uses `devspace agents targets`, `run`, `continue`, `show`, and `ls`.
+The skill uses `devspace agents targets`, `run`, `continue`, `show`, `wait`, and `ls`.
 These commands do not require `devspace serve`.
+
+This Coding Agent installation is separate from ChatGPT MCP usage. For MCP
+workspaces with Subagents enabled, DevSpace manages its own copy at
+`~/.devspace/skills/subagents/SKILL.md`; users do not install that copy
+manually.
 
 ### Connect ChatGPT
 
@@ -98,6 +109,10 @@ Configure the MCP client with the full MCP endpoint:
 ```text
 https://your-tunnel-host.example.com/mcp
 ```
+
+Protocol compatibility is automatic. DevSpace serves MCP 2026-07-28 requests
+directly and handles older 2025-era clients statelessly on the same endpoint;
+there is no client-protocol setting to maintain.
 
 A Coding Agents-only setup skips this section.
 
@@ -150,7 +165,10 @@ pinned in `package.json`. Install it with `npm install --global pnpm@11.25.0`.
 
 ```bash
 pnpm install --frozen-lockfile
+pnpm dev:seed
 pnpm dev
 ```
 
-The same setup rules apply.
+The source server uses an ignored checkout-local fork of your normal DevSpace
+configuration and SQLite state. See [Development and Manual QA](development.md)
+for worktree switching, ChatGPT testing, and database migration workflows.

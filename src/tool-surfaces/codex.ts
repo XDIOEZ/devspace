@@ -1,11 +1,15 @@
 import * as z from "zod/v4";
 import { applyPatch } from "../apply-patch.js";
-import type { ProcessSnapshot } from "../process-sessions.js";
+import {
+  MAX_PROCESS_YIELD_MS,
+  type ProcessSnapshot,
+} from "../process-sessions.js";
 import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
   toolNames,
   workspaceIdDescription,
+  type ToolLogFields,
   type ToolRegistrationContext,
 } from "./types.js";
 import {
@@ -18,7 +22,7 @@ import {
 
 type CodexRegistration = (context: ToolRegistrationContext) => void;
 
-const CODEX_INSTRUCTIONS = `Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Commands run with the local user's authority and are not sandboxed; workspace validation only selects their initial working directory. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
+const CODEX_INSTRUCTIONS = `Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
 
 export function codexInstructions(): string {
   return CODEX_INSTRUCTIONS;
@@ -48,12 +52,12 @@ function processResult(snapshot: ProcessSnapshot): string {
 
 function processOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
-    sessionId: z.number().optional(),
+    session_id: z.number().optional(),
     running: z.boolean(),
-    exitCode: z.number().int().optional(),
+    exit_code: z.number().int().optional(),
     signal: z.string().optional(),
-    wallTimeMs: z.number().nonnegative(),
-    outputTruncated: z.boolean(),
+    wall_time_ms: z.number().nonnegative(),
+    output_truncated: z.boolean(),
   });
 }
 
@@ -64,12 +68,12 @@ function processToolResponse(snapshot: ProcessSnapshot) {
     content,
     structuredContent: {
       result,
-      sessionId: snapshot.sessionId,
+      session_id: snapshot.sessionId,
       running: snapshot.running,
-      exitCode: snapshot.exitCode,
+      exit_code: snapshot.exitCode,
       signal: snapshot.signal,
-      wallTimeMs: snapshot.wallTimeMs,
-      outputTruncated: snapshot.outputTruncated,
+      wall_time_ms: snapshot.wallTimeMs,
+      output_truncated: snapshot.outputTruncated,
     },
   };
 }
@@ -82,9 +86,9 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
     {
       title: "Apply patch",
       description:
-        "Apply one Codex-style patch in a workspace. Supports adding, overwriting, updating, deleting, and moving files. Use this for all file modifications. Paths must be relative to the workspace.",
+        "Apply one Codex-style patch to add, overwrite, update, delete, or move workspace files. Paths must be relative to the workspace.",
       inputSchema: {
-        workspaceId: z.string().describe(workspaceIdDescription),
+        workspace_id: z.string().describe(workspaceIdDescription),
         patch: z
           .string()
           .describe(
@@ -97,21 +101,22 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
         files: z.array(
           z.object({
             path: z.string(),
-            previousPath: z.string().optional(),
+            previous_path: z.string().optional(),
             operation: z.enum(["add", "update", "delete", "move"]),
           }),
         ),
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, patch }) => {
+    async ({ workspace_id, patch }) => {
       const startedAt = performance.now();
+      const workspaceId = workspace_id;
       const applied = await runLoggedToolOperation(
         config,
         { tool: "apply_patch", workspaceId },
         startedAt,
         async () => {
-          const workspace = workspaces.getWorkspace(workspaceId);
+          const workspace = await workspaces.getWorkspace(workspaceId);
           return applyPatch(workspace.root, patch);
         },
       );
@@ -125,7 +130,10 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           result,
           additions: applied.additions,
           removals: applied.removals,
-          files: applied.files,
+          files: applied.files.map(({ previousPath, ...file }) => ({
+            ...file,
+            previous_path: previousPath,
+          })),
         },
       };
     },
@@ -142,7 +150,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       description:
         "Run one or more commands with the local user's authority. Commands are not sandboxed; workspace validation only selects the initial working directory. Multiple commands run in order in one shell process. Returns the result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
       inputSchema: {
-        workspaceId: z.string().describe(workspaceIdDescription),
+        workspace_id: z.string().describe(workspaceIdDescription),
         cmd: z
           .union([
             z.string().min(1),
@@ -171,22 +179,22 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           .max(1_000)
           .optional()
           .describe("Initial PTY height. Defaults to 24."),
-        workingDirectory: z
+        working_directory: z
           .string()
           .optional()
           .describe(
             "Working directory relative to the workspace root. Defaults to the workspace root.",
           ),
-        yieldTimeMs: z
+        yield_time_ms: z
           .number()
           .int()
           .min(0)
-          .max(30_000)
+          .max(MAX_PROCESS_YIELD_MS)
           .optional()
           .describe(
-            "Milliseconds to wait before returning a running session. Defaults to 10000.",
+            "Milliseconds to wait before returning a running session. Defaults to 10000, maximum 12000. Use write_stdin for work that runs longer.",
           ),
-        maxOutputTokens: z
+        max_output_tokens: z
           .number()
           .int()
           .positive()
@@ -198,16 +206,20 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({
-      workspaceId,
+      workspace_id,
       cmd,
       tty,
       columns,
       rows,
-      workingDirectory,
-      yieldTimeMs,
-      maxOutputTokens,
+      working_directory,
+      yield_time_ms,
+      max_output_tokens,
     }) => {
       const startedAt = performance.now();
+      const workspaceId = workspace_id;
+      const workingDirectory = working_directory;
+      const yieldTimeMs = yield_time_ms;
+      const maxOutputTokens = max_output_tokens;
       const command = mergeShellCommands(
         cmd,
         process.platform === "win32" ? " & " : "\n",
@@ -223,8 +235,8 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
         },
         startedAt,
         async () => {
-          const workspace = workspaces.getWorkspace(workspaceId);
-          const cwd = workspaces.resolveWorkingDirectory(
+          const workspace = await workspaces.getWorkspace(workspaceId);
+          const cwd = await workspaces.resolveWorkingDirectory(
             workspace,
             workingDirectory,
           );
@@ -240,6 +252,7 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
             maxOutputTokens,
           });
         },
+        processLogFields,
       );
 
       return processToolResponse(snapshot);
@@ -253,10 +266,10 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       description:
         "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pass \\u0003 to send Ctrl-C.",
       inputSchema: {
-        workspaceId: z
+        workspace_id: z
           .string()
           .describe("Workspace identifier used to start the process."),
-        sessionId: z
+        session_id: z
           .number()
           .describe("Process session identifier returned by exec_command."),
         chars: z
@@ -279,16 +292,16 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           .max(1_000)
           .optional()
           .describe("Resize a PTY to this height."),
-        yieldTimeMs: z
+        yield_time_ms: z
           .number()
           .int()
           .min(0)
-          .max(30_000)
+          .max(MAX_PROCESS_YIELD_MS)
           .optional()
           .describe(
-            "Milliseconds to wait for process output or completion. Defaults to 10000.",
+            "Milliseconds to wait for process output or completion. Maximum 12000; polling defaults to 5000 and interactive writes to 250.",
           ),
-        maxOutputTokens: z
+        max_output_tokens: z
           .number()
           .int()
           .positive()
@@ -300,21 +313,25 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({
-      workspaceId,
-      sessionId,
+      workspace_id,
+      session_id,
       chars,
       columns,
       rows,
-      yieldTimeMs,
-      maxOutputTokens,
+      yield_time_ms,
+      max_output_tokens,
     }) => {
       const startedAt = performance.now();
+      const workspaceId = workspace_id;
+      const sessionId = session_id;
+      const yieldTimeMs = yield_time_ms;
+      const maxOutputTokens = max_output_tokens;
       const snapshot = await runLoggedToolOperation(
         config,
         { tool: "write_stdin", workspaceId },
         startedAt,
         async () => {
-          workspaces.getWorkspace(workspaceId);
+          await workspaces.getWorkspace(workspaceId);
           return processSessions.write({
             workspaceId,
             sessionId,
@@ -325,9 +342,24 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
             maxOutputTokens,
           });
         },
+        processLogFields,
       );
 
       return processToolResponse(snapshot);
     },
   );
+}
+
+export function processLogFields(result: ProcessSnapshot): Partial<ToolLogFields> {
+  const success = result.running || (!result.signal && result.exitCode === 0);
+  const termination = result.signal
+    ? `Process terminated by signal ${result.signal}.`
+    : `Process exited with code ${result.exitCode ?? "unknown"}.`;
+  return {
+    sessionId: result.sessionId,
+    running: result.running,
+    exitCode: result.exitCode,
+    success,
+    ...(success ? {} : { error: termination }),
+  };
 }

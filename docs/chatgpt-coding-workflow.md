@@ -14,18 +14,18 @@ ChatGPT should call `open_workspace` once for a project folder:
 }
 ```
 
-The result includes a `workspaceId`. All later file, search, edit, show-changes,
-and shell calls should reuse that same `workspaceId`.
+The result includes a `workspace_id`. All later file, search, edit, show-changes,
+and shell calls should reuse that same `workspace_id`.
 
 ChatGPT may support automatic checkout recovery through optional host
 conversation metadata. This is an OpenAI-host adapter detail, not a standard MCP
 conversation field. When that optional context is available, opening the same
 checkout project again in the same conversation can continue in the existing
 workspace, and the context already provided for that reused checkout is not
-repeated. The portable workflow remains the same: keep using the `workspaceId`
+repeated. The portable workflow remains the same: keep using the `workspace_id`
 returned by `open_workspace` for later operations. Hosts without supported
 conversation context receive a normal new workspace and continue with that
-explicit `workspaceId` workflow.
+explicit `workspace_id` workflow.
 The model receives actionable workspace instructions; automatic-reuse
 bookkeeping is not a model-facing choice.
 
@@ -43,7 +43,7 @@ own context.
 
 Do not call `open_workspace` again for the same checkout folder unless:
 
-- the `workspaceId` is rejected as unknown
+- the `workspace_id` is rejected as unknown
 - work moves to a different project folder
 - work switches between checkout and worktree mode
 - the user asks for a new isolated worktree
@@ -78,10 +78,10 @@ Managed worktrees are created under:
 ```
 
 Worktree mode requires a Git repository with at least one commit. It starts from
-`HEAD` unless `baseRef` is provided.
+`HEAD` unless `base_ref` is provided.
 
 Each worktree-mode call creates a new managed worktree and returns a new
-`workspaceId`. Reuse that ID for work inside that worktree; call
+`workspace_id`. Reuse that ID for work inside that worktree; call
 `open_workspace` in worktree mode again only when another isolated worktree is
 actually required.
 
@@ -98,7 +98,7 @@ When a workspace opens, DevSpace loads root-level instruction files:
 - `CLAUDE.md`
 - `CLAUDE.MD`
 
-Nested instruction files are returned as `availableAgentsFiles`. The model
+Nested instruction files are returned as `available_agents_files`. The model
 should read the relevant nested file before working under that directory.
 
 This keeps instructions explicit and inspectable instead of silently injecting
@@ -116,9 +116,13 @@ DevSpace discovers standard Agent Skills from:
 
 It also keeps compatibility with:
 
-- the bundled `subagents` skill when Subagents are enabled, unless `~/.devspace/skills/subagents/SKILL.md` exists
 - `skills.agentDir/skills`, defaulting to `~/.codex/skills`
 - additional paths from `skills.paths`
+
+When Subagents are enabled, DevSpace synchronizes its bundled workflow to the
+managed path `~/.devspace/skills/subagents/SKILL.md`. That copy is refreshed
+from the installed DevSpace package and wins over other skills named
+`subagents`.
 
 When Subagents are enabled, DevSpace discovers agent profiles
 from `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
@@ -137,14 +141,17 @@ advertised `SKILL.md` before following that skill.
 
 Skill paths may be outside the workspace. DevSpace only permits reading:
 
-- advertised `SKILL.md` files
-- files under a skill directory after that skill's `SKILL.md` has been read
+- files within advertised skill directories
 
 Set `skills.enabled` to `false` to hide skills from workspace output. Enable
 Subagents and choose providers through `devspace init` or the persisted provider
-configuration. The bundled `subagents` skill teaches the minimal
+configuration. `subagents.instructions` defaults to `on-demand`, which exposes
+the managed `subagents` skill for a separate read only when the model decides
+delegation would help. Set it to `preload` to include those instructions in the
+initial `open_workspace` result instead. The skill teaches the minimal
 `devspace agents targets`, `devspace agents ls`, `devspace agents run`,
-`devspace agents continue`, and `devspace agents show` workflow. The catalog
+`devspace agents continue`, `devspace agents show`, and `devspace agents wait`
+workflow. The catalog
 comes from `open_workspace`; `devspace agents ls` lists existing subagent
 sessions for that workspace.
 
@@ -197,10 +204,10 @@ the review point automatically. Reusing a workspace does not change this
 workflow.
 
 The model-facing result stays compact: DevSpace returns the workspace ID, a
-Git-backed `reviewRef`, and the summary text. MCP Apps hosts receive the full
+Git-backed `review_ref`, and the summary text. MCP Apps hosts receive the full
 file list and patch in result metadata for immediate rendering. If a host later
 restores only the structured result, the review card can reopen that exact
-`reviewRef` from DevSpace's Git review history without advancing the current
+`review_ref` from DevSpace's Git review history without advancing the current
 review point.
 
 For local inspection, run `devspace show-changes <review-ref>`. Add `--json` to
